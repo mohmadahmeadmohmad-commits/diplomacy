@@ -1,0 +1,131 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && (
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin') ||
+        (request.auth.token.email == "mohmadahmeadmohmad@gmail.com" && request.auth.token.email_verified == true)
+      );
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+    
+    function uidUnchanged() {
+      return !('uid' in request.resource.data) || request.resource.data.uid == request.auth.uid;
+    }
+    
+    function uidNotModified() {
+      return !('uid' in request.resource.data) || request.resource.data.uid == resource.data.uid;
+    }
+
+    function isValidEmail(email) {
+      return email is string && email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidUser(data) {
+      return data.name is string && data.name.size() > 0 && data.name.size() < 100 &&
+             (data.email == "" || (data.email is string && isValidEmail(data.email))) &&
+             data.role in ['admin', 'agent', 'owner', 'customer'] &&
+             (!('favorites' in data) || data.favorites is list) &&
+             (!('phoneNumber' in data) || data.phoneNumber is string);
+    }
+
+    function isValidProperty(data) {
+      return data.title is string && data.title.size() > 0 && data.title.size() < 200 &&
+             data.category in ['apartment', 'villa', 'land', 'commercial'] &&
+             data.listingType in ['sale', 'rent'] &&
+             data.price is number && data.price >= 0 &&
+             data.area is number && data.area > 0 &&
+             data.status in ['pending', 'published', 'rejected'] &&
+             data.ownerId is string && data.ownerId.size() > 0 &&
+             (!('views' in data) || (data.views is number && data.views >= 0)) &&
+             (!('phoneNumber' in data) || data.phoneNumber is string);
+    }
+
+    function isValidComment(data) {
+      return data.text is string && data.text.size() > 0 && data.text.size() < 1000 &&
+             data.rating is number && data.rating >= 1 && data.rating <= 5 &&
+             data.userId is string && data.userId == request.auth.uid &&
+             data.userName is string;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      // Anyone authenticated can read user profiles (to see agent info)
+      allow read: if isAuthenticated();
+      
+      // Users can create their own profile. Only admin can set role to admin.
+      allow create: if isOwner(userId) && 
+                    hasRequiredFields(['uid', 'name', 'email', 'role', 'createdAt']) &&
+                    isValidUser(request.resource.data) &&
+                    uidUnchanged() &&
+                    (request.resource.data.role == 'customer' || request.resource.data.role == 'agent' || request.resource.data.role == 'owner' || isAdmin());
+                    
+      // Users can update their own profile (but not role). Admins can update anything.
+      allow update: if isAuthenticated() && isValidUser(request.resource.data) && uidNotModified() && (
+                      (isOwner(userId) && request.resource.data.role == resource.data.role) || 
+                      isAdmin()
+                    );
+    }
+
+    match /properties/{propertyId} {
+      // Anyone can read published properties. Admins can read all. Owners can read their own.
+      allow read: if (resource.data.status == 'published') || 
+                     isAdmin() || 
+                     (isAuthenticated() && resource.data.ownerId == request.auth.uid);
+                     
+      // Authenticated users can create properties. Status must be pending unless admin.
+      allow create: if isAuthenticated() && 
+                    hasRequiredFields(['ownerId', 'title', 'category', 'listingType', 'price', 'area', 'location', 'status', 'createdAt']) &&
+                    isValidProperty(request.resource.data) &&
+                    request.resource.data.ownerId == request.auth.uid &&
+                    (request.resource.data.status == 'pending' || isAdmin());
+                    
+      // Owners can update their own properties, but status must remain pending or reset to pending. Admins can update status.
+      // Anyone can increment views on published properties.
+      allow update: if isValidProperty(request.resource.data) && (
+                      isAdmin() || 
+                      (isAuthenticated() && resource.data.ownerId == request.auth.uid && 
+                       request.resource.data.ownerId == resource.data.ownerId &&
+                       request.resource.data.status == 'pending') ||
+                      (
+                        resource.data.status == 'published' &&
+                        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['views']) &&
+                        request.resource.data.views == resource.data.views + 1
+                      )
+                    );
+                    
+      allow delete: if isAdmin() || (isAuthenticated() && resource.data.ownerId == request.auth.uid);
+      
+      match /comments/{commentId} {
+        allow read: if true;
+        allow create: if isAuthenticated() && isValidComment(request.resource.data) && request.resource.data.propertyId == propertyId;
+        allow update, delete: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+      }
+    }
+  }
+}
